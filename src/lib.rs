@@ -1037,21 +1037,7 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                                     TaskResultValue::Err(e) if e == &new_error_message => (),
 
                                     // Previous state is a different error.
-                                    TaskResultValue::Err(old_error) => {
-                                        if let Some(config) = app.notifier_config().as_ref() {
-                                            config
-                                                .handle_alert(
-                                                    &http_client,
-                                                    Alert::NewFailure {
-                                                        task: label.clone(),
-                                                        old_error: old_error.to_string(),
-                                                        new_error: new_error_message.clone(),
-                                                    },
-                                                    &*app,
-                                                )
-                                                .await;
-                                        }
-                                    }
+                                    TaskResultValue::Err(_old_error) => (),
                                     // Previous state is Ok, now it's an error.
                                     TaskResultValue::Ok(_) => {
                                         if let Some(config) = app.notifier_config().as_ref() {
