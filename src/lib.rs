@@ -908,10 +908,13 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                                         }
                                     }
                                     TaskResultValue::NotYetRun | TaskResultValue::Info(_)
-                                        if error => Some(Alert::FirstFailure {
+                                        if error =>
+                                    {
+                                        Some(Alert::FirstFailure {
                                             task: label.clone(),
                                             error: message.to_string(),
-                                        }),
+                                        })
+                                    }
                                     _ => None,
                                 }
                             } else {
@@ -1113,7 +1116,121 @@ fn validate_delay(delay: Delay) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{config::Delay, retry_limit_reached, validate_delay};
+    use super::{
+        NotifierConfig, TaskLabel, TaskResultValue, WatchedTask, WatchedTaskOutput,
+        WatcherAppContext, WatcherBuilder,
+        config::{Delay, TaskConfig, WatcherConfig},
+        retry_limit_reached,
+        slack::SlackConfig,
+        validate_delay,
+    };
+    use anyhow::Result;
+    use reqwest::Url;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::Notify;
+
+    const LABEL: &str = "test-task";
+
+    #[derive(Clone)]
+    struct TestApp {
+        config: WatcherConfig,
+        notifier: Option<NotifierConfig>,
+    }
+
+    impl TestApp {
+        fn new(retries: usize) -> Self {
+            Self {
+                config: WatcherConfig {
+                    retries,
+                    delay_between_retries: 0,
+                    tasks: HashMap::from([(
+                        LABEL.to_owned(),
+                        TaskConfig {
+                            delay: Delay::NoDelay,
+                            out_of_date: None,
+                            retries: None,
+                            delay_between_retries: None,
+                        },
+                    )]),
+                },
+                notifier: None,
+            }
+        }
+    }
+
+    impl WatcherAppContext for TestApp {
+        fn title(&self) -> String {
+            "test".to_owned()
+        }
+
+        fn environment(&self) -> Option<String> {
+            None
+        }
+
+        fn build_version(&self) -> Option<String> {
+            None
+        }
+
+        fn watcher_config(&self) -> WatcherConfig {
+            self.config.clone()
+        }
+
+        fn triggers_alert(&self, _label: &TaskLabel, _selected: Option<&TaskLabel>) -> bool {
+            self.notifier.is_some()
+        }
+
+        fn notifier_config(&self) -> Option<NotifierConfig> {
+            self.notifier.clone()
+        }
+
+        fn show_output(&self, _label: &TaskLabel) -> bool {
+            false
+        }
+    }
+
+    struct AlwaysFails {
+        attempts: Arc<AtomicUsize>,
+        failure_limit: usize,
+    }
+
+    impl WatchedTask<TestApp> for AlwaysFails {
+        async fn run_single(
+            &mut self,
+            _app: Arc<TestApp>,
+            _heartbeat: super::Heartbeat,
+        ) -> Result<WatchedTaskOutput> {
+            if self.attempts.load(Ordering::SeqCst) == self.failure_limit {
+                return std::future::pending().await;
+            }
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("expected failure")
+        }
+    }
+
+    struct ReportsErrorThenWaits {
+        first: bool,
+    }
+
+    impl WatchedTask<TestApp> for ReportsErrorThenWaits {
+        async fn run_single(
+            &mut self,
+            _app: Arc<TestApp>,
+            _heartbeat: super::Heartbeat,
+        ) -> Result<WatchedTaskOutput> {
+            if std::mem::take(&mut self.first) {
+                Ok(WatchedTaskOutput::new("reported error").set_error())
+            } else {
+                std::future::pending().await
+            }
+        }
+    }
 
     #[test]
     fn configured_retries_are_additional_attempts() {
@@ -1128,5 +1245,94 @@ mod tests {
     fn rejects_inverted_random_delay_range() {
         assert!(validate_delay(Delay::Random { low: 5, high: 4 }).is_err());
         assert!(validate_delay(Delay::Random { low: 4, high: 5 }).is_ok());
+    }
+
+    #[tokio::test]
+    async fn periodic_task_makes_configured_retries_as_additional_attempts() {
+        for retries in [0, 1, 3] {
+            let app = Arc::new(TestApp::new(retries));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let mut builder = WatcherBuilder::new(app);
+            let label = TaskLabel::new(LABEL);
+            builder
+                .watch_periodic(
+                    label.clone(),
+                    AlwaysFails {
+                        attempts: attempts.clone(),
+                        failure_limit: retries + 1,
+                    },
+                )
+                .unwrap();
+            let status = builder.watcher.statuses.get(&label).unwrap().clone();
+            let periodic = builder.watcher.to_spawn.pop().unwrap().future;
+            let periodic = tokio::spawn(periodic);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if status.read().await.counts.errors == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(attempts.load(Ordering::SeqCst), retries + 1);
+            periodic.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reads_are_not_blocked_by_slow_notification() {
+        let request_started = Arc::new(Notify::new());
+        let release_response = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post({
+                let request_started = request_started.clone();
+                let release_response = release_response.clone();
+                move || {
+                    let request_started = request_started.clone();
+                    let release_response = release_response.clone();
+                    async move {
+                        request_started.notify_one();
+                        release_response.notified().await;
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let mut app = TestApp::new(0);
+        app.notifier = Some(NotifierConfig::Slack(SlackConfig {
+            webhook_url: Url::parse(&format!("http://{address}/")).unwrap(),
+        }));
+        let mut builder = WatcherBuilder::new(Arc::new(app));
+        let label = TaskLabel::new(LABEL);
+        builder
+            .watch_periodic(label.clone(), ReportsErrorThenWaits { first: true })
+            .unwrap();
+        let status = builder.watcher.statuses.get(&label).unwrap().clone();
+        let periodic = tokio::spawn(builder.watcher.to_spawn.pop().unwrap().future);
+
+        tokio::time::timeout(Duration::from_secs(2), request_started.notified())
+            .await
+            .unwrap();
+        let status_guard = tokio::time::timeout(Duration::from_millis(200), status.read())
+            .await
+            .expect("status read lock was held while the notification was in flight");
+        assert!(matches!(
+            status_guard.last_result.value.as_ref(),
+            TaskResultValue::Err(error) if error == "reported error"
+        ));
+        drop(status_guard);
+
+        release_response.notify_one();
+        periodic.abort();
+        server.abort();
     }
 }
