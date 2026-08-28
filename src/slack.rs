@@ -26,7 +26,6 @@ impl SlackConfig {
                 self.send_resolved_alert(client, task, &old_error, &new_message, app)
                     .await
             }
-            Alert::NewFailure { .. } => Ok(()),
             Alert::FirstFailure { task, error } => self.send_alert(client, task, &error, app).await,
         }
     }

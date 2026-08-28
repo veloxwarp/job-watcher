@@ -51,12 +51,6 @@ pub enum Alert {
         old_error: String,
         new_message: String,
     },
-    /// A task was failing, and is still failing but with a different error.
-    NewFailure {
-        task: TaskLabel,
-        old_error: String,
-        new_error: String,
-    },
     /// A task has failed for the first time.
     FirstFailure { task: TaskLabel, error: String },
 }
@@ -823,6 +817,7 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
 
         let label_clone = label.clone();
         let config = task_config_for(&self.app.watcher_config(), &label);
+        validate_delay(config.delay)?;
         let out_of_date = config
             .out_of_date
             .map(|seconds| Span::new().seconds(seconds));
@@ -892,64 +887,36 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                         } else {
                             tracing::debug!("{label}: Success! {message}");
                         }
-                        {
+                        let pending_alert = {
                             let mut guard = task_status.write().await;
                             let old = &*guard;
-                            let _title = label.to_string();
-                            if app.triggers_alert(&label, None) {
+                            let pending_alert = if app.triggers_alert(&label, None) {
                                 match &*old.last_result.value {
-                                    TaskResultValue::Ok(_) => {
-                                        if error {
-                                            // Was a success, but not a success now
-                                            if let Some(config) = app.notifier_config().as_ref() {
-                                                config
-                                                    .handle_alert(
-                                                        &http_client,
-                                                        Alert::Down {
-                                                            task: label.clone(),
-                                                            error: message.to_string(),
-                                                        },
-                                                        &*app,
-                                                    )
-                                                    .await;
-                                            }
-                                        }
-                                    }
+                                    TaskResultValue::Ok(_) if error => Some(Alert::Down {
+                                        task: label.clone(),
+                                        error: message.to_string(),
+                                    }),
                                     TaskResultValue::Err(err) => {
-                                        if !error
-                                            && let Some(config) = app.notifier_config().as_ref()
-                                        {
-                                            config
-                                                .handle_alert(
-                                                    &http_client,
-                                                    Alert::Recovered {
-                                                        task: label.clone(),
-                                                        old_error: err.to_string(),
-                                                        new_message: message.to_string(),
-                                                    },
-                                                    &*app,
-                                                )
-                                                .await;
+                                        if error {
+                                            None
+                                        } else {
+                                            Some(Alert::Recovered {
+                                                task: label.clone(),
+                                                old_error: err.to_string(),
+                                                new_message: message.to_string(),
+                                            })
                                         }
                                     }
-                                    TaskResultValue::NotYetRun | TaskResultValue::Info(_) => {
-                                        if error
-                                            && let Some(config) = app.notifier_config().as_ref()
-                                        {
-                                            config
-                                                .handle_alert(
-                                                    &http_client,
-                                                    Alert::FirstFailure {
-                                                        task: label.clone(),
-                                                        error: message.to_string(),
-                                                    },
-                                                    &*app,
-                                                )
-                                                .await;
-                                        }
-                                    }
+                                    TaskResultValue::NotYetRun | TaskResultValue::Info(_)
+                                        if error => Some(Alert::FirstFailure {
+                                            task: label.clone(),
+                                            error: message.to_string(),
+                                        }),
+                                    _ => None,
                                 }
-                            }
+                            } else {
+                                None
+                            };
                             let last_run_seconds = {
                                 if let Some(old_run_started) = old.current_run_started.clone() {
                                     let duration = Zoned::now() - old_run_started;
@@ -988,6 +955,12 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                                 expire_last_result: expire_alert,
                                 last_run_seconds,
                             };
+                            pending_alert
+                        };
+                        if let (Some(alert), Some(config)) =
+                            (pending_alert, app.notifier_config().as_ref())
+                        {
+                            config.handle_alert(&http_client, alert, &*app).await;
                         }
                         retries = 0;
                         if !skip_delay {
@@ -1017,7 +990,7 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                         }
                         retries += 1;
                         let max_retries = config.retries.unwrap_or(app.watcher_config().retries);
-                        if retries >= max_retries {
+                        if retry_limit_reached(retries, max_retries) {
                             retries = 0;
                             let mut guard = task_status.write().await;
                             let old = &*guard;
@@ -1031,45 +1004,29 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                             };
                             let new_error_message = format!("{err:?}");
 
-                            if app.triggers_alert(&label, None) {
+                            let pending_alert = if app.triggers_alert(&label, None) {
                                 match &*old.last_result.value {
                                     // The same error is happening as before
-                                    TaskResultValue::Err(e) if e == &new_error_message => (),
+                                    TaskResultValue::Err(e) if e == &new_error_message => None,
 
                                     // Previous state is a different error.
-                                    TaskResultValue::Err(_old_error) => (),
+                                    TaskResultValue::Err(_old_error) => None,
                                     // Previous state is Ok, now it's an error.
-                                    TaskResultValue::Ok(_) => {
-                                        if let Some(config) = app.notifier_config().as_ref() {
-                                            config
-                                                .handle_alert(
-                                                    &http_client,
-                                                    Alert::Down {
-                                                        task: label.clone(),
-                                                        error: new_error_message.clone(),
-                                                    },
-                                                    &*app,
-                                                )
-                                                .await;
-                                        }
-                                    }
+                                    TaskResultValue::Ok(_) => Some(Alert::Down {
+                                        task: label.clone(),
+                                        error: new_error_message.clone(),
+                                    }),
                                     // Previous state is unknown (NotYetRun) or Info
                                     TaskResultValue::NotYetRun | TaskResultValue::Info(_) => {
-                                        if let Some(config) = app.notifier_config().as_ref() {
-                                            config
-                                                .handle_alert(
-                                                    &http_client,
-                                                    Alert::FirstFailure {
-                                                        task: label.clone(),
-                                                        error: new_error_message.clone(),
-                                                    },
-                                                    &*app,
-                                                )
-                                                .await;
-                                        }
+                                        Some(Alert::FirstFailure {
+                                            task: label.clone(),
+                                            error: new_error_message.clone(),
+                                        })
                                     }
                                 }
-                            }
+                            } else {
+                                None
+                            };
                             *guard = TaskStatus {
                                 last_result: TaskResult {
                                     value: TaskResultValue::Err(new_error_message).into(),
@@ -1085,6 +1042,12 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
                                 expire_last_result: None,
                                 last_run_seconds,
                             };
+                            drop(guard);
+                            if let (Some(alert), Some(config)) =
+                                (pending_alert, app.notifier_config().as_ref())
+                            {
+                                config.handle_alert(&http_client, alert, &*app).await;
+                            }
                         } else {
                             {
                                 let mut guard = task_status.write().await;
@@ -1131,5 +1094,39 @@ impl<C: WatcherAppContext + Send + Sync + Clone + 'static> WatcherBuilder<C> {
             label: label_clone,
         });
         Ok(())
+    }
+}
+
+fn retry_limit_reached(failures: usize, configured_retries: usize) -> bool {
+    failures > configured_retries
+}
+
+fn validate_delay(delay: Delay) -> Result<()> {
+    if let Delay::Random { low, high } = delay {
+        anyhow::ensure!(
+            low <= high,
+            "random delay lower bound {low} exceeds upper bound {high}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config::Delay, retry_limit_reached, validate_delay};
+
+    #[test]
+    fn configured_retries_are_additional_attempts() {
+        assert!(retry_limit_reached(1, 0));
+        assert!(!retry_limit_reached(1, 1));
+        assert!(retry_limit_reached(2, 1));
+        assert!(!retry_limit_reached(3, 3));
+        assert!(retry_limit_reached(4, 3));
+    }
+
+    #[test]
+    fn rejects_inverted_random_delay_range() {
+        assert!(validate_delay(Delay::Random { low: 5, high: 4 }).is_err());
+        assert!(validate_delay(Delay::Random { low: 4, high: 5 }).is_ok());
     }
 }
