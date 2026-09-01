@@ -42,6 +42,8 @@ jobs:
             .
       - name: Compile
         run: just cargo-compile
+      - name: Test
+        run: cargo test --workspace --locked
       - name: Clippy
         run: just cargo-clippy-check
       - name: Rustfmt
